@@ -5202,6 +5202,9 @@ impl TextSearcher {
                 )) as Box<dyn Query>,
             ));
         }
+        if let Some(countries) = self.countries_query(filters.countries) {
+            subqueries.push((Occur::Must, countries));
+        }
         if let Some(bbox) = filters.bbox {
             subqueries.push((Occur::Must, self.bbox_query(bbox)));
         }
@@ -5238,6 +5241,12 @@ impl TextSearcher {
                 )
             })
             .collect::<Vec<_>>();
+        if let Some(layer) = filters.layer.map(str::trim).filter(|layer| !layer.is_empty()) {
+            clauses.push((Occur::Must, self.layer_query(layer)));
+        }
+        if let Some(countries) = self.countries_query(filters.countries) {
+            clauses.push((Occur::Must, countries));
+        }
         if let Some(bbox) = filters.bbox {
             clauses.push((Occur::Must, self.bbox_query(bbox)));
         }
@@ -12391,6 +12400,39 @@ mod tests {
         street.geometry = point_geometry(lon, lat);
         street.representative_point = [lon, lat];
         street
+    }
+
+    #[test]
+    fn native_search_filters_country_and_layer_before_limit() {
+        use crate::record::PlaceLayer::{Country, Locality, Region};
+
+        let dir = temp_pack_path("native-search-filters");
+        let mut writer = Writer::create(&dir).expect("writer");
+        let at = [10.0, 50.0];
+        let de = place(&mut writer, Country, "Germany", ObjectType::Relation, 1, at, None);
+        let ca = place(&mut writer, Country, "Canada", ObjectType::Relation, 2, at, None);
+        writer.set_country_codes([
+            (de, CountryCode::parse("DE").expect("code")),
+            (ca, CountryCode::parse("CA").expect("code")),
+        ].into_iter().collect());
+        place(&mut writer, Locality, "Bertown", ObjectType::Relation, 3, at, chain(&[(Country, ca)]));
+        place(&mut writer, Region, "Bertown", ObjectType::Relation, 4, at, chain(&[(Country, de)]));
+        place(&mut writer, Locality, "Bertown", ObjectType::Relation, 5, at, chain(&[(Country, de)]));
+        place(&mut writer, Locality, "Bertown", ObjectType::Relation, 6, at, None);
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&dir).expect("searcher");
+        let countries = vec!["DE".to_string()];
+        let filters = Filters::new(Some("locality"), &countries, None);
+        let named = searcher.places_by_name("Bertown", &filters, None, 1).expect("named");
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].record.id, "osm:relation:5");
+        let autocomplete = searcher.autocomplete(&TextAutocompleteOptions {
+            query: "Ber".to_string(), limit: 1, layer: Some("locality".to_string()),
+            countries, focus: None, bbox: None,
+        }).expect("autocomplete");
+        assert_eq!(autocomplete.len(), 1);
+        assert_eq!(autocomplete[0].record.id, "osm:relation:5");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
