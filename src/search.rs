@@ -15,7 +15,7 @@ use levenshtein_automata::{DFA, Distance, SINK_STATE};
 use serde::Serialize;
 use tantivy::{
     DocAddress, DocId, DocSet, IndexReader, Score, Searcher, SegmentReader, Term,
-    collector::{ScoreSegmentTweaker, ScoreTweaker, TopDocs},
+    collector::{DocSetCollector, FilterCollector, ScoreSegmentTweaker, ScoreTweaker, TopDocs},
     columnar::{Column, StrColumn},
     index::SegmentId,
     query::{
@@ -169,11 +169,15 @@ impl<'a> Filters<'a> {
     /// Whether a hit lies where the filters ask: inside the box, when there
     /// is one. A document's extent only says some of its records may.
     fn admit(&self, hit: &TextSearchHit) -> bool {
-        self.bbox.is_none_or(|bbox| {
-            hit.record
-                .point
-                .is_some_and(|point| bbox.contains(point.lon, point.lat))
-        })
+        self.layer
+            .map(str::trim)
+            .filter(|layer| !layer.is_empty())
+            .is_none_or(|layer| hit.record.layer == layer)
+            && self.bbox.is_none_or(|bbox| {
+                hit.record
+                    .point
+                    .is_some_and(|point| bbox.contains(point.lon, point.lat))
+            })
     }
 }
 
@@ -2204,7 +2208,9 @@ impl TextSearcher {
                 };
                 let ids = match part.label {
                     Label::Postcode => match compact_postcode(&part.words.join(" ")) {
-                        Some(postcode) => self.postcode_records(&[postcode], AREA_ANSWERS)?,
+                        Some(postcode) => {
+                            self.postcode_records_in(&[postcode], cx.search.filters.countries)?
+                        }
                         None => Vec::new(),
                     },
                     Label::Locality => dictionaries
@@ -2219,6 +2225,11 @@ impl TextSearcher {
                         .map(RecordId::from)
                         .collect(),
                     _ => continue,
+                };
+                let ids = if part.label == Label::Postcode {
+                    ids
+                } else {
+                    self.country_area_ids(&key, ids, cx.search.filters.countries)?
                 };
                 if !ids.is_empty() {
                     parts.push((part.label, ids));
@@ -2257,7 +2268,19 @@ impl TextSearcher {
                     found.push(street);
                     break;
                 }
-                for id in kept.into_iter().take(AREA_ANSWERS) {
+                let layer = cx
+                    .search
+                    .filters
+                    .layer
+                    .map(str::trim)
+                    .filter(|layer| !layer.is_empty());
+                let mut admitted = 0;
+                for id in kept {
+                    if let Some(layer) = layer
+                        && self.pack.records().header(id)?.layer.as_str() != layer
+                    {
+                        continue;
+                    }
                     let record = self.pack.record_summary(id)?;
                     let Some(point) = record.point else {
                         continue;
@@ -2279,6 +2302,10 @@ impl TextSearcher {
                     if !cx.search.filters.admit(&hit) {
                         continue;
                     }
+                    if admitted == AREA_ANSWERS {
+                        break;
+                    }
+                    admitted += 1;
                     found.push(StructuredFound {
                         hit,
                         point: [point.lon, point.lat],
@@ -2311,6 +2338,18 @@ impl TextSearcher {
         reading: &Reading,
         index: usize,
     ) -> Result<Option<StructuredFound>> {
+        if cx
+            .search
+            .filters
+            .layer
+            .map(str::trim)
+            .filter(|layer| !layer.is_empty())
+            .is_some_and(|layer| {
+                layer != Layer::Address.as_str() && layer != Layer::Street.as_str()
+            })
+        {
+            return Ok(None);
+        }
         let structured = cx.structured;
         let plan = &reading.plan;
         let words = plan
@@ -2518,6 +2557,18 @@ impl TextSearcher {
         numbered: bool,
         accept: &mut impl FnMut(&Session, &QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
     ) -> Result<(Vec<StructuredFound>, usize, bool)> {
+        if cx
+            .search
+            .filters
+            .layer
+            .map(str::trim)
+            .filter(|layer| !layer.is_empty())
+            .is_some_and(|layer| {
+                layer != Layer::Address.as_str() && layer != Layer::Street.as_str()
+            })
+        {
+            return Ok((Vec::new(), 0, false));
+        }
         let structured = cx.structured;
         let plan = &reading.plan;
         let countries = self.structured_countries(plan, &cx.search.filters);
@@ -2654,6 +2705,17 @@ impl TextSearcher {
             let mut keyed = candidates
                 .into_iter()
                 .filter_map(|(doc, support, form, base)| {
+                    let requested = cx
+                        .search
+                        .filters
+                        .layer
+                        .map(str::trim)
+                        .filter(|layer| !layer.is_empty());
+                    if requested.is_some_and(|layer| {
+                        (form == FORM_STREET) != (layer == Layer::Street.as_str())
+                    }) {
+                        return None;
+                    }
                     let [lon, lat] = self.doc_point(doc)?;
                     let layer = self.doc_layer(doc)?;
                     let ranking = match base {
@@ -5124,10 +5186,80 @@ impl TextSearcher {
         Ok(weights)
     }
 
+    fn country_area_ids(
+        &self,
+        name: &str,
+        ids: Vec<RecordId>,
+        countries: &[String],
+    ) -> Result<Vec<RecordId>> {
+        let Some(country) = self.countries_query(countries) else {
+            return Ok(ids);
+        };
+        if ids.is_empty() {
+            return Ok(ids);
+        }
+        let wanted: Arc<HashSet<RecordId>> = Arc::new(ids.iter().copied().collect());
+        let mut clauses = name
+            .split_whitespace()
+            .map(|word| {
+                (
+                    Occur::Must,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.fields.name_text, word),
+                        IndexRecordOption::WithFreqs,
+                    )) as Box<dyn Query>,
+                )
+            })
+            .collect::<Vec<_>>();
+        if clauses.is_empty() {
+            return Ok(Vec::new());
+        }
+        clauses.push((Occur::Must, country));
+        let searcher = self.reader.searcher();
+        let collector = FilterCollector::new(
+            "record_id".to_string(),
+            move |id: u64| wanted.contains(&id),
+            TopDocs::with_limit(ids.len()),
+        );
+        let found = searcher
+            .search(&BooleanQuery::new(clauses), &collector)?
+            .into_iter()
+            .map(|(_, doc)| self.document_records(&searcher, doc).map(|record| record.0))
+            .collect::<Result<HashSet<_>>>()?;
+        Ok(ids.into_iter().filter(|id| found.contains(id)).collect())
+    }
+
     /// The Pack's postcode records of any of `terms`, as the postcode field
     /// indexes them.
     fn postcode_records(&self, terms: &[String], limit: usize) -> Result<Vec<RecordId>> {
-        let query = BooleanQuery::new(vec![
+        let searcher = self.reader.searcher();
+        searcher
+            .search(
+                &self.postcode_records_query(terms, &[]),
+                &TopDocs::with_limit(limit),
+            )?
+            .into_iter()
+            .map(|(_, doc)| Ok(self.document_records(&searcher, doc)?.0))
+            .collect()
+    }
+
+    fn postcode_records_in(&self, terms: &[String], countries: &[String]) -> Result<Vec<RecordId>> {
+        let searcher = self.reader.searcher();
+        let mut docs = searcher
+            .search(
+                &self.postcode_records_query(terms, countries),
+                &DocSetCollector,
+            )?
+            .into_iter()
+            .collect::<Vec<_>>();
+        docs.sort_unstable_by_key(|doc| (doc.segment_ord, doc.doc_id));
+        docs.into_iter()
+            .map(|doc| Ok(self.document_records(&searcher, doc)?.0))
+            .collect()
+    }
+
+    fn postcode_records_query(&self, terms: &[String], countries: &[String]) -> BooleanQuery {
+        let mut clauses = vec![
             (Occur::Must, self.layer_query(Layer::Postcode.as_str())),
             (
                 Occur::Must,
@@ -5146,13 +5278,11 @@ impl TextSearcher {
                         .collect(),
                 )),
             ),
-        ]);
-        let searcher = self.reader.searcher();
-        searcher
-            .search(&query, &TopDocs::with_limit(limit))?
-            .into_iter()
-            .map(|(_, doc)| Ok(self.document_records(&searcher, doc)?.0))
-            .collect()
+        ];
+        if let Some(country) = self.countries_query(countries) {
+            clauses.push((Occur::Must, country));
+        }
+        BooleanQuery::new(clauses)
     }
 
     fn build_autocomplete_query(
@@ -5241,7 +5371,11 @@ impl TextSearcher {
                 )
             })
             .collect::<Vec<_>>();
-        if let Some(layer) = filters.layer.map(str::trim).filter(|layer| !layer.is_empty()) {
+        if let Some(layer) = filters
+            .layer
+            .map(str::trim)
+            .filter(|layer| !layer.is_empty())
+        {
             clauses.push((Occur::Must, self.layer_query(layer)));
         }
         if let Some(countries) = self.countries_query(filters.countries) {
@@ -12409,27 +12543,118 @@ mod tests {
         let dir = temp_pack_path("native-search-filters");
         let mut writer = Writer::create(&dir).expect("writer");
         let at = [10.0, 50.0];
-        let de = place(&mut writer, Country, "Germany", ObjectType::Relation, 1, at, None);
-        let ca = place(&mut writer, Country, "Canada", ObjectType::Relation, 2, at, None);
-        writer.set_country_codes([
-            (de, CountryCode::parse("DE").expect("code")),
-            (ca, CountryCode::parse("CA").expect("code")),
-        ].into_iter().collect());
-        place(&mut writer, Locality, "Bertown", ObjectType::Relation, 3, at, chain(&[(Country, ca)]));
-        place(&mut writer, Region, "Bertown", ObjectType::Relation, 4, at, chain(&[(Country, de)]));
-        place(&mut writer, Locality, "Bertown", ObjectType::Relation, 5, at, chain(&[(Country, de)]));
-        place(&mut writer, Locality, "Bertown", ObjectType::Relation, 6, at, None);
+        let de = place(
+            &mut writer,
+            Country,
+            "Germany",
+            ObjectType::Relation,
+            1,
+            at,
+            None,
+        );
+        let ca = place(
+            &mut writer,
+            Country,
+            "Canada",
+            ObjectType::Relation,
+            2,
+            at,
+            None,
+        );
+        writer.set_country_codes(
+            [
+                (de, CountryCode::parse("DE").expect("code")),
+                (ca, CountryCode::parse("CA").expect("code")),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let foreign = place(
+            &mut writer,
+            Locality,
+            "Bertown",
+            ObjectType::Relation,
+            3,
+            at,
+            chain(&[(Country, ca)]),
+        );
+        let region = place(
+            &mut writer,
+            Region,
+            "Bertown",
+            ObjectType::Relation,
+            4,
+            at,
+            chain(&[(Country, de)]),
+        );
+        let local = place(
+            &mut writer,
+            Locality,
+            "Bertown",
+            ObjectType::Relation,
+            5,
+            at,
+            chain(&[(Country, de)]),
+        );
+        let unknown = place(
+            &mut writer,
+            Locality,
+            "Bertown",
+            ObjectType::Relation,
+            6,
+            at,
+            None,
+        );
+        let mut matching_postcode = 0;
+        for n in 0..=AREA_ANSWERS {
+            let town = if n == AREA_ANSWERS { local } else { region };
+            matching_postcode = writer
+                .write(
+                    &PostcodeRecord {
+                        postcode: "92421".to_string(),
+                        country: CountryCode::parse("DE"),
+                        geometry: point_geometry(at[0], at[1]),
+                        source: DerivedSourceProvenance::osm_address_records(1),
+                    }
+                    .into(),
+                    chain(&[(Country, de), (Locality, town)]),
+                )
+                .expect("postcode");
+        }
         writer.finish().expect("finish");
         let searcher = TextSearcher::open(&dir).expect("searcher");
         let countries = vec!["DE".to_string()];
+        assert_eq!(
+            searcher
+                .country_area_ids("bertown", vec![foreign, region, local, unknown], &countries)
+                .expect("country areas"),
+            vec![region, local]
+        );
+        let postcode_ids = searcher
+            .postcode_records_in(&["92421".to_string()], &countries)
+            .expect("postcodes");
+        assert_eq!(postcode_ids.len(), AREA_ANSWERS + 1);
+        let nested = postcode_ids
+            .into_iter()
+            .filter(|&id| searcher.postcode_in(id, &[local]).expect("nesting"))
+            .collect::<Vec<_>>();
+        assert_eq!(nested, vec![matching_postcode]);
         let filters = Filters::new(Some("locality"), &countries, None);
-        let named = searcher.places_by_name("Bertown", &filters, None, 1).expect("named");
+        let named = searcher
+            .places_by_name("Bertown", &filters, None, 1)
+            .expect("named");
         assert_eq!(named.len(), 1);
         assert_eq!(named[0].record.id, "osm:relation:5");
-        let autocomplete = searcher.autocomplete(&TextAutocompleteOptions {
-            query: "Ber".to_string(), limit: 1, layer: Some("locality".to_string()),
-            countries, focus: None, bbox: None,
-        }).expect("autocomplete");
+        let autocomplete = searcher
+            .autocomplete(&TextAutocompleteOptions {
+                query: "Ber".to_string(),
+                limit: 1,
+                layer: Some("locality".to_string()),
+                countries,
+                focus: None,
+                bbox: None,
+            })
+            .expect("autocomplete");
         assert_eq!(autocomplete.len(), 1);
         assert_eq!(autocomplete[0].record.id, "osm:relation:5");
         let _ = std::fs::remove_dir_all(dir);
